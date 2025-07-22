@@ -1,73 +1,83 @@
-import { createClient } from 'redis';
+const { createClient } = require('redis');
+const fetch = require('node-fetch');
 
-export async function handler(event) {
-  const client = createClient({ url: process.env.REDIS_URL });
-
+exports.handler = async function (event, context) {
   try {
-    await client.connect();
+    // 🔌 Conexión a Redis
+    const redisUrl = process.env.REDIS_URL;
+    if (!redisUrl) throw new Error('REDIS_URL no está definido en variables de entorno');
 
-    const body = JSON.parse(event.body);
-    const tokenData = body.message.data; // asegúrate que viene con este formato
-    const tokenId = tokenData.id;
+    const redis = createClient({ url: redisUrl });
+    await redis.connect();
 
-    // 1. Verifica si ya se procesó
-    if (await client.exists(tokenId)) {
-      console.log("Token ya procesado");
+    const keys = await redis.keys('*');
+    const datos = [];
+
+    for (const key of keys) {
+      const value = await redis.get(key);
+      datos.push({ key, value });
+    }
+
+    await redis.disconnect();
+
+    if (datos.length === 0) {
       return {
         statusCode: 200,
-        body: "Token ya procesado",
+        body: JSON.stringify({ message: 'No hay datos en Redis.' }),
       };
     }
 
-    // 2. Analizar sentimiento del token
-    const sentiment = await analyzeSentiment(tokenData.description);
+    // 🧠 Análisis con Hugging Face (sentiment analysis de ejemplo)
+    const huggingFaceToken = process.env.HUGGINGFACE_API_KEY;
+    if (!huggingFaceToken) throw new Error('HUGGINGFACE_API_KEY no está definido');
 
-    // 3. Si el sentimiento es positivo, enviar a Worker de coordinación
-    const result = await sendToCoordinator({
-      ...tokenData,
-      sentiment: sentiment[0]?.label ?? "NEUTRAL",
+    const hfResponse = await fetch(
+      'https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${huggingFaceToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          inputs: datos.map(d => d.value).join('\n'),
+        }),
+      }
+    );
+
+    const hfResult = await hfResponse.json();
+
+    // 🚀 Envío de resultados al Worker de Cloudflare
+    const cloudflareUrl = process.env.CLOUDFLARE_WORKER_URL;
+    if (!cloudflareUrl) throw new Error('CLOUDFLARE_WORKER_URL no está definido');
+
+    const sendResponse = await fetch(cloudflareUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timestamp: new Date().toISOString(),
+        datos: datos,
+        analisis: hfResult,
+      }),
     });
 
-    // 4. Guardar en Redis por 24h para no repetir
-    await client.setEx(tokenId, 86400, "procesado");
+    const sendResult = await sendResponse.text();
 
     return {
       statusCode: 200,
-      body: "Procesado con éxito",
+      body: JSON.stringify({
+        message: '✅ Datos analizados y enviados con éxito',
+        keys: keys.length,
+        cloudflare_response: sendResult,
+      }),
     };
-  } catch (err) {
-    console.error("ERROR:", err);
+  } catch (error) {
+    console.error('❌ Error en birdeye.js:', error);
     return {
       statusCode: 500,
-      body: "Error interno",
+      body: JSON.stringify({
+        error: error.message || 'Error interno en función birdeye',
+      }),
     };
-  } finally {
-    await client.quit();
   }
-}
-
-// 🧠 Función para análisis de sentimiento con Hugging Face
-async function analyzeSentiment(texto) {
-  const response = await fetch(
-    "https://api-inference.huggingface.co/models/finiteautomata/bertweet-base-sentiment-analysis",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.HF_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ inputs: texto }),
-    }
-  );
-  return await response.json();
-}
-
-// 🔁 Función para enviar a Cloudflare Worker
-async function sendToCoordinator(data) {
-  const response = await fetch("https://coordinacion-worker.TUSUBDOMINIO.workers.dev", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  return await response.text();
-}
+};
