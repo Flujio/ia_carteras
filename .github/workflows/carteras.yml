@@ -1,0 +1,22 @@
+name: Ejecución Carteras
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # Cada 15 minutos
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run script
+        run: python main.py
+      - name: Publicar en Pub/Sub
+        uses: google-github-actions/publish-to-pubsub@v0
+        with:
+          topic: ${{ secrets.PUBSUB_TOPIC }}
+          message: '{"data": "ejemplo"}'
+          credentials: ${{ secrets.GCP_CREDENTIALS }}
