@@ -1,12 +1,2 @@
 [build]
-  command = ""
   functions = "netlify/functions"
-
-[functions]
-  node_bundler = "esbuild"
-
-# Programar la función birdeye para que se ejecute cada minuto
-[[scheduled.functions]]
-  function = "birdeye"
-  # Aquí cron: cada minuto. Ajusta a "*/5 * * * *" para 5 min, etc.
-  cron = "*/1 * * * *"
