@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 import Redis from 'ioredis';
 
 const {
@@ -8,6 +7,7 @@ const {
   HF_TOKEN
 } = process.env;
 
+// Global fetch is available in Netlify Functions, no need de 'node-fetch'
 const redis = new Redis(REDIS_URL);
 
 export async function handler(event) {
@@ -23,7 +23,7 @@ export async function handler(event) {
       testMode = true;
       console.log('🔧 Test mode active, using provided swap:', swap);
     } else {
-      // 1. Traer swaps recientes de Birdeye (todos los tokens)
+      // 1. Fetch swaps recientes de Birdeye (todos los tokens)
       const resp = await fetch('https://public-api.birdeye.so/public/token/all/recent_swaps', {
         headers: { 'x-chain': 'solana' }
       });
