@@ -1,4 +1,8 @@
-import fetch from 'node-fetch';
+/*
+2. Actualiza tu función birdeye.js para usar el fetch global y la librería ioredis:
+*/
+
+// netlify/functions/birdeye.js
 import Redis from 'ioredis';
 
 const {
@@ -8,7 +12,6 @@ const {
   HF_TOKEN
 } = process.env;
 
-// Inicializar Redis
 const redis = new Redis(REDIS_URL);
 
 export async function handler() {
@@ -65,7 +68,7 @@ export async function handler() {
     // 7. Construir tags dinámicos
     const tags = ['#Solana'];
     if (isWhale) tags.push('#whale');
-    if (swap.firstSwap) tags.push('#newToken'); // si lo quieres detectar
+    if (swap.firstSwap) tags.push('#newToken');
 
     // 8. Enviar al Worker
     const payload = {
