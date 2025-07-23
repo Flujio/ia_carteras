@@ -1,83 +1,103 @@
-const { createClient } = require('redis');
-const fetch = require('node-fetch');
+import fetch from 'node-fetch';
+import Redis from 'ioredis';
 
-exports.handler = async function (event, context) {
+const {
+  REDIS_URL,
+  WORKER_URL,
+  MIN_SWAP_USD = '5000',
+  HF_TOKEN
+} = process.env;
+
+// Inicializar Redis
+const redis = new Redis(REDIS_URL);
+
+export async function handler() {
   try {
-    // 🔌 Conexión a Redis
-    const redisUrl = process.env.REDIS_URL;
-    if (!redisUrl) throw new Error('REDIS_URL no está definido en variables de entorno');
+    // 1. Traer swaps recientes de Birdeye (todos los tokens)
+    const resp = await fetch('https://public-api.birdeye.so/public/token/all/recent_swaps', {
+      headers: { 'x-chain': 'solana' }
+    });
+    const { data = [] } = await resp.json();
+    if (!data.length) return ok('No hay swaps recientes');
 
-    const redis = createClient({ url: redisUrl });
-    await redis.connect();
+    // 2. Filtrar por volumen mínimo
+    const threshold = parseFloat(MIN_SWAP_USD);
+    const grandes = data.filter(s => s.amountUsd >= threshold);
+    if (!grandes.length) return ok(`No hay swaps ≥ $${threshold}`);
 
-    const keys = await redis.keys('*');
-    const datos = [];
+    // 3. Seleccionar el swap más grande
+    const swap = grandes.sort((a,b)=> b.amountUsd - a.amountUsd)[0];
+    const tx = swap.txSignature;
 
-    for (const key of keys) {
-      const value = await redis.get(key);
-      datos.push({ key, value });
+    // 4. Evitar duplicados: si ya existe la tx en Redis
+    if (await redis.exists(tx)) {
+      return ok(`Swap ${tx} ya procesado`);
     }
 
-    await redis.disconnect();
+    // 5. Detectar ballena: mismo wallet >2 swaps en 10 min
+    const walletKeyPattern = `wallet:${swap.userAddress}:*`;
+    const prevKeys = await redis.keys(walletKeyPattern);
+    const isWhale = prevKeys.length >= 2;
 
-    if (datos.length === 0) {
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ message: 'No hay datos en Redis.' }),
-      };
-    }
+    // Guardar esta tx bajo la key 'wallet:address:timestamp'
+    const timestamp = Math.floor(Date.now()/1000);
+    await redis.set(`wallet:${swap.userAddress}:${timestamp}`, tx, 'EX', 600);
 
-    // 🧠 Análisis con Hugging Face (sentiment analysis de ejemplo)
-    const huggingFaceToken = process.env.HUGGINGFACE_API_KEY;
-    if (!huggingFaceToken) throw new Error('HUGGINGFACE_API_KEY no está definido');
-
-    const hfResponse = await fetch(
+    // 6. Análisis IA con Hugging Face
+    const text = `${swap.tokenSymbol} volumen ${swap.amountUsd.toFixed(2)} USD`;
+    const hfResp = await fetch(
       'https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english',
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${huggingFaceToken}`,
-          'Content-Type': 'application/json',
+          Authorization: `Bearer ${HF_TOKEN}`,
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          inputs: datos.map(d => d.value).join('\n'),
-        }),
+        body: JSON.stringify({ inputs: text })
       }
     );
+    const hfJson = await hfResp.json();
+    const score = hfJson[0]?.score ?? 0;
+    if (score < 0.7) {
+      return ok(`Score IA bajo (${score.toFixed(2)}) para ${swap.tokenSymbol}`);
+    }
 
-    const hfResult = await hfResponse.json();
+    // 7. Construir tags dinámicos
+    const tags = ['#Solana'];
+    if (isWhale) tags.push('#whale');
+    if (swap.firstSwap) tags.push('#newToken'); // si lo quieres detectar
 
-    // 🚀 Envío de resultados al Worker de Cloudflare
-    const cloudflareUrl = process.env.CLOUDFLARE_WORKER_URL;
-    if (!cloudflareUrl) throw new Error('CLOUDFLARE_WORKER_URL no está definido');
-
-    const sendResponse = await fetch(cloudflareUrl, {
+    // 8. Enviar al Worker
+    const payload = {
+      analisis: {
+        token: swap.tokenSymbol,
+        volumen: swap.amountUsd,
+        score,
+        tags,
+        comentario: `Swap ${swap.tokenSymbol} por $${swap.amountUsd.toFixed(2)}`
+      }
+    };
+    await fetch(WORKER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        timestamp: new Date().toISOString(),
-        datos: datos,
-        analisis: hfResult,
-      }),
+      body: JSON.stringify(payload)
     });
 
-    const sendResult = await sendResponse.text();
+    // 9. Marcar esta tx como procesada por 10 min
+    await redis.set(tx, 'ok', 'EX', 600);
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        message: '✅ Datos analizados y enviados con éxito',
-        keys: keys.length,
-        cloudflare_response: sendResult,
-      }),
-    };
-  } catch (error) {
-    console.error('❌ Error en birdeye.js:', error);
+    return ok(`Swap ${tx} enviado al Worker`);
+  }
+  catch(err) {
+    console.error('❌ Error en birdeye:', err);
     return {
       statusCode: 500,
-      body: JSON.stringify({
-        error: error.message || 'Error interno en función birdeye',
-      }),
+      body: JSON.stringify({ error: err.message })
     };
   }
-};
+}
+
+// helper para respuestas 200
+function ok(msg) {
+  return { statusCode: 200, body: msg };
+}
