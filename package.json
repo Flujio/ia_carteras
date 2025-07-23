@@ -1,5 +1,119 @@
+/*
+1. Asegúrate de tener un package.json en la raíz con las dependencias:
+*/
+
+// package.json (en la raíz del repo)
 {
+  "name": "solana-ia-carteras",
+  "version": "1.0.0",
   "dependencies": {
-    "redis": "^4.6.7"
+    "ioredis": "^5.3.2"
   }
+}
+
+/*
+2. Actualiza tu función birdeye.js para usar el fetch global y la librería ioredis:
+*/
+
+// netlify/functions/birdeye.js
+import Redis from 'ioredis';
+
+const {
+  REDIS_URL,
+  WORKER_URL,
+  MIN_SWAP_USD = '5000',
+  HF_TOKEN
+} = process.env;
+
+const redis = new Redis(REDIS_URL);
+
+export async function handler() {
+  try {
+    // 1. Traer swaps recientes de Birdeye (todos los tokens)
+    const resp = await fetch('https://public-api.birdeye.so/public/token/all/recent_swaps', {
+      headers: { 'x-chain': 'solana' }
+    });
+    const { data = [] } = await resp.json();
+    if (!data.length) return ok('No hay swaps recientes');
+
+    // 2. Filtrar por volumen mínimo
+    const threshold = parseFloat(MIN_SWAP_USD);
+    const grandes = data.filter(s => s.amountUsd >= threshold);
+    if (!grandes.length) return ok(`No hay swaps ≥ $${threshold}`);
+
+    // 3. Seleccionar el swap más grande
+    const swap = grandes.sort((a,b)=> b.amountUsd - a.amountUsd)[0];
+    const tx = swap.txSignature;
+
+    // 4. Evitar duplicados: si ya existe la tx en Redis
+    if (await redis.exists(tx)) {
+      return ok(`Swap ${tx} ya procesado`);
+    }
+
+    // 5. Detectar ballena: mismo wallet >2 swaps en 10 min
+    const walletKeyPattern = `wallet:${swap.userAddress}:*`;
+    const prevKeys = await redis.keys(walletKeyPattern);
+    const isWhale = prevKeys.length >= 2;
+
+    // Guardar esta tx bajo la key 'wallet:address:timestamp'
+    const timestamp = Math.floor(Date.now()/1000);
+    await redis.set(`wallet:${swap.userAddress}:${timestamp}`, tx, 'EX', 600);
+
+    // 6. Análisis IA con Hugging Face
+    const text = `${swap.tokenSymbol} volumen ${swap.amountUsd.toFixed(2)} USD`;
+    const hfResp = await fetch(
+      'https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${HF_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ inputs: text })
+      }
+    );
+    const hfJson = await hfResp.json();
+    const score = hfJson[0]?.score ?? 0;
+    if (score < 0.7) {
+      return ok(`Score IA bajo (${score.toFixed(2)}) para ${swap.tokenSymbol}`);
+    }
+
+    // 7. Construir tags dinámicos
+    const tags = ['#Solana'];
+    if (isWhale) tags.push('#whale');
+    if (swap.firstSwap) tags.push('#newToken');
+
+    // 8. Enviar al Worker
+    const payload = {
+      analisis: {
+        token: swap.tokenSymbol,
+        volumen: swap.amountUsd,
+        score,
+        tags,
+        comentario: `Swap ${swap.tokenSymbol} por $${swap.amountUsd.toFixed(2)}`
+      }
+    };
+    await fetch(WORKER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    // 9. Marcar esta tx como procesada por 10 min
+    await redis.set(tx, 'ok', 'EX', 600);
+
+    return ok(`Swap ${tx} enviado al Worker`);
+  }
+  catch(err) {
+    console.error('❌ Error en birdeye:', err);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: err.message })
+    };
+  }
+}
+
+// helper para respuestas 200
+function ok(msg) {
+  return { statusCode: 200, body: msg };
 }
